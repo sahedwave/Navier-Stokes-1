@@ -1,0 +1,778 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<title>Wind Engine — Cinematic Fluid Visualization</title>
+<style>
+  body { margin:0; overflow:hidden; background:#0b0f1a; font-family:system-ui, sans-serif; }
+  canvas { display:block; touch-action:none; }
+  #controls {
+    position: absolute;
+    top: 20px;
+    left: 20px;
+    background: rgba(11,15,26,0.92);
+    color: #b0e0ff;
+    padding: 16px 20px;
+    border-radius: 12px;
+    box-shadow: 0 8px 32px rgba(0,0,0,0.6);
+    backdrop-filter: blur(10px);
+    z-index: 100;
+    min-width: 240px;
+    display: none;
+    user-select: none;
+  }
+  .control { display: flex; align-items: center; justify-content: space-between; margin: 12px 0; font-size: 13px; }
+  .control label { min-width: 110px; }
+  input[type="range"] { width: 170px; accent-color: #60c0ff; }
+  .value { font-family: monospace; font-size: 12px; width: 42px; text-align: right; }
+  h3 { margin: 0 0 14px 0; font-size: 14px; letter-spacing: 0.5px; opacity: 0.9; }
+</style>
+</head>
+<body>
+<canvas id="c"></canvas>
+
+<!-- Minimal production controls -->
+<div id="controls">
+  <h3>FLUID CONTROLS</h3>
+  
+  <div class="control">
+    <label>Bloom Intensity</label>
+    <input type="range" id="bloomS" min="0" max="0.6" step="0.005" value="0.22">
+    <span id="bloomVal" class="value">0.22</span>
+  </div>
+  
+  <div class="control">
+    <label>Trail Persistence</label>
+    <input type="range" id="trailS" min="0.85" max="0.999" step="0.001" value="0.958">
+    <span id="trailVal" class="value">0.958</span>
+  </div>
+  
+  <div class="control">
+    <label>Filament Strength</label>
+    <input type="range" id="filS" min="0" max="2" step="0.05" value="1">
+    <span id="filVal" class="value">1.00</span>
+  </div>
+  
+  <div style="margin-top:16px; font-size:11px; opacity:0.75; line-height:1.3;">
+    Press <strong>H</strong> to toggle • Drag mouse / touch to stir the wind
+  </div>
+</div>
+
+<script>
+const canvas = document.getElementById("c");
+const ctx = canvas.getContext("2d");
+canvas.width = window.innerWidth;
+canvas.height = window.innerHeight;
+
+// =====================================================
+// 1. TUNABLE VISUAL PARAMETERS (easy future tuning)
+// =====================================================
+let bloomIntensity = 0.22;
+let trailPersistenceAlpha = 0.958;
+let filamentMultiplier = 1.0;
+
+// =====================================================
+// 2. RENDER FX BUFFERS
+// =====================================================
+const renderFX = {
+  sceneCanvas: null, sceneCtx: null,
+  bloomCanvas: null, bloomCtx: null,
+  trailCanvas: null, trailCtx: null,
+  feedbackCanvas: null, feedbackCtx: null
+};
+
+// =====================================================
+// 3. SIMULATION CORE (unchanged — physics preserved exactly)
+// =====================================================
+const W = 128;
+const H = 128;
+
+let velocity = new Float32Array(W * H * 2);
+let velocityPrev = new Float32Array(W * H * 2);
+let density = new Float32Array(W * H);
+let temperature = new Float32Array(W * H);
+
+let curl = new Float32Array(W * H);
+let tempPrev = new Float32Array(W * H);
+let velPrevBuffer = new Float32Array(W * H * 2);
+let div = new Float32Array(W * H);
+let pressure = new Float32Array(W * H);
+
+const FIXED_STEP_MS = 1000 / 60;
+const MAX_FRAME_MS = 100;
+let lastFrameTime = 0;
+let accumulator = 0;
+let simTime = 0;
+
+function IX(x, y) { return (x + y * W) * 2; }
+
+function multiScaleTurbulence(time) {
+  for (let y = 1; y < H - 1; y++) {
+    for (let x = 1; x < W - 1; x++) {
+      let i = IX(x, y);
+      let scale1 = Math.sin((x + time * 0.2) * 0.05) * Math.cos((y + time * 0.2) * 0.05);
+      let scale2 = Math.sin((x + time * 0.4) * 0.15) * Math.cos((y + time * 0.4) * 0.15);
+      let scale3 = Math.sin((x + time * 0.8) * 0.4) * Math.cos((y + time * 0.8) * 0.4);
+      velocity[i] += (scale1 + 0.5 * scale2 + 0.25 * scale3) * 0.02;
+      velocity[i + 1] += (scale1 - scale2 + scale3) * 0.02;
+    }
+  }
+}
+
+function applyBuoyancy(time) {
+  let tGlobal = time * 0.001;
+  for (let y = 0; y < H; y++) {
+    for (let x = 0; x < W; x++) {
+      let t = temperature[x + y * W];
+      let i = IX(x, y);
+      let n = Math.sin(x * 0.1 + y * 0.1 + tGlobal);
+      velocity[i] += n * t * 0.02;
+      velocity[i + 1] -= t * 0.05;
+    }
+  }
+}
+
+function updateTemperature() {
+  tempPrev.set(temperature);
+  for (let y = 1; y < H - 1; y++) {
+    for (let x = 1; x < W - 1; x++) {
+      let t = tempPrev[x + y * W] * 0.96 + (tempPrev[(x + 1) + y * W] + tempPrev[(x - 1) + y * W] + tempPrev[x + (y + 1) * W] + tempPrev[x + (y - 1) * W]) * 0.01;
+      temperature[x + y * W] = Math.min(50, Math.max(0, t));
+    }
+  }
+}
+
+function advectTemperature() {
+  tempPrev.set(temperature);
+  for (let y = 1; y < H - 1; y++) {
+    for (let x = 1; x < W - 1; x++) {
+      let i = IX(x, y);
+      let vx = velocity[i], vy = velocity[i + 1];
+      let px = Math.max(0.5, Math.min(W - 1.5, x - vx * 0.5));
+      let py = Math.max(0.5, Math.min(H - 1.5, y - vy * 0.5));
+      let x0 = Math.floor(px), y0 = Math.floor(py), x1 = x0 + 1, y1 = y0 + 1;
+      let sx = px - x0, sy = py - y0;
+      let t00 = tempPrev[x0 + y0 * W], t10 = tempPrev[x1 + y0 * W],
+          t01 = tempPrev[x0 + y1 * W], t11 = tempPrev[x1 + y1 * W];
+      temperature[x + y * W] = (1 - sx) * (1 - sy) * t00 + sx * (1 - sy) * t10 + (1 - sx) * sy * t01 + sx * sy * t11;
+    }
+  }
+}
+
+function diffuseVelocity() {
+  velPrevBuffer.set(velocity);
+  for (let y = 1; y < H - 1; y++) {
+    for (let x = 1; x < W - 1; x++) {
+      let i = IX(x, y);
+      velocity[i] = (velPrevBuffer[i] + velPrevBuffer[IX(x + 1, y)] + velPrevBuffer[IX(x - 1, y)] + velPrevBuffer[IX(x, y + 1)] + velPrevBuffer[IX(x, y - 1)]) * 0.2;
+      velocity[i + 1] = (velPrevBuffer[i + 1] + velPrevBuffer[IX(x + 1, y) + 1] + velPrevBuffer[IX(x - 1, y) + 1] + velPrevBuffer[IX(x, y + 1) + 1] + velPrevBuffer[IX(x, y - 1) + 1]) * 0.2;
+    }
+  }
+}
+
+function advect() {
+  for (let y = 1; y < H - 1; y++) {
+    for (let x = 1; x < W - 1; x++) {
+      const i = IX(x, y);
+      let vx = velocityPrev[i], vy = velocityPrev[i + 1];
+      let px = Math.max(0.5, Math.min(W - 1.5, x - vx * 0.5));
+      let py = Math.max(0.5, Math.min(H - 1.5, y - vy * 0.5));
+      let x0 = Math.floor(px), y0 = Math.floor(py), x1 = x0 + 1, y1 = y0 + 1;
+      let sx = px - x0, sy = py - y0;
+      let i00 = IX(x0, y0), i10 = IX(x1, y0), i01 = IX(x0, y1), i11 = IX(x1, y1);
+      velocity[i] = (1 - sx) * (1 - sy) * velocityPrev[i00] + sx * (1 - sy) * velocityPrev[i10] + (1 - sx) * sy * velocityPrev[i01] + sx * sy * velocityPrev[i11];
+      velocity[i + 1] = (1 - sx) * (1 - sy) * velocityPrev[i00 + 1] + sx * (1 - sy) * velocityPrev[i10 + 1] + (1 - sx) * sy * velocityPrev[i01 + 1] + sx * sy * velocityPrev[i11 + 1];
+    }
+  }
+}
+
+function project() {
+  div.fill(0); pressure.fill(0);
+  for (let y = 1; y < H - 1; y++) {
+    for (let x = 1; x < W - 1; x++) {
+      div[x + y * W] = -0.5 * (velocity[IX(x + 1, y)] - velocity[IX(x - 1, y)] + velocity[IX(x, y + 1) + 1] - velocity[IX(x, y - 1) + 1]);
+    }
+  }
+  for (let k = 0; k < 10; k++) {
+    for (let y = 1; y < H - 1; y++) {
+      for (let x = 1; x < W - 1; x++) {
+        pressure[x + y * W] = (div[x + y * W] + pressure[x - 1 + y * W] + pressure[x + 1 + y * W] + pressure[x + (y - 1) * W] + pressure[x + (y + 1) * W]) / 4;
+      }
+    }
+  }
+  for (let y = 1; y < H - 1; y++) {
+    for (let x = 1; x < W - 1; x++) {
+      let i = IX(x, y);
+      velocity[i] -= 0.5 * (pressure[x + 1 + y * W] - pressure[x - 1 + y * W]);
+      velocity[i + 1] -= 0.5 * (pressure[x + (y + 1) * W] - pressure[x + (y - 1) * W]);
+    }
+  }
+}
+
+function applyBoundaries() {
+  for (let x = 0; x < W; x++) {
+    let top = IX(x, 0), bottom = IX(x, H - 1);
+    velocity[top] *= -0.5; velocity[top + 1] = 0;
+    velocity[bottom] *= -0.5; velocity[bottom + 1] = 0;
+  }
+  for (let y = 0; y < H; y++) {
+    let left = IX(0, y), right = IX(W - 1, y);
+    velocity[left] = 0; velocity[left + 1] *= -0.5;
+    velocity[right] = 0; velocity[right + 1] *= -0.5;
+  }
+}
+
+function vorticityConfinement() {
+  for (let y = 1; y < H - 1; y++) {
+    for (let x = 1; x < W - 1; x++) {
+      let dx = velocity[IX(x + 1, y) + 1] - velocity[IX(x - 1, y) + 1];
+      let dy = velocity[IX(x, y + 1)] - velocity[IX(x, y - 1)];
+      curl[x + y * W] = Math.abs(dx - dy);
+    }
+  }
+  for (let y = 2; y < H - 2; y++) {
+    for (let x = 2; x < W - 2; x++) {
+      let gradX = curl[(x + 1) + y * W] - curl[(x - 1) + y * W];
+      let gradY = curl[x + (y + 1) * W] - curl[x + (y - 1) * W];
+      let len = Math.sqrt(gradX * gradX + gradY * gradY) + 0.0001;
+      gradX /= len; gradY /= len;
+      let i = IX(x, y);
+      let vorticity = curl[x + y * W];
+      velocity[i] += gradY * vorticity * 0.1;
+      velocity[i + 1] -= gradX * vorticity * 0.1;
+    }
+  }
+}
+
+// =====================================================
+// 4. PARTICLES (preserved exactly — still updated, not rendered)
+// =====================================================
+const particles = [];
+for (let i = 0; i < 2000; i++) {
+  particles.push({ x: Math.random() * canvas.width, y: Math.random() * canvas.height, vx: 0, vy: 0, size: Math.random() * 2 + 1, angle: Math.random() * Math.PI * 2, spin: (Math.random() - 0.5) * 0.1 });
+}
+
+// =====================================================
+// 5. SAMPLING, ENERGY & LIGHTING HELPERS
+// =====================================================
+function sampleVelocity(px, py) {
+  let x = Math.floor((px / canvas.width) * W);
+  let y = Math.floor((py / canvas.height) * H);
+  x = Math.max(0, Math.min(W - 1, x));
+  y = Math.max(0, Math.min(H - 1, y));
+  let i = IX(x, y);
+  return { x: velocity[i], y: velocity[i + 1] };
+}
+
+function sampleScalarBilinear(field, px, py, scale = 1) {
+  px = Math.max(0, Math.min(W - 1.001, px));
+  py = Math.max(0, Math.min(H - 1.001, py));
+  const x0 = Math.floor(px), y0 = Math.floor(py);
+  const x1 = Math.min(W - 1, x0 + 1), y1 = Math.min(H - 1, y0 + 1);
+  const sx = px - x0, sy = py - y0;
+  const a = field[x0 + y0 * W] * scale;
+  const b = field[x1 + y0 * W] * scale;
+  const c = field[x0 + y1 * W] * scale;
+  const d = field[x1 + y1 * W] * scale;
+  return a * (1 - sx) * (1 - sy) + b * sx * (1 - sy) + c * (1 - sx) * sy + d * sx * sy;
+}
+
+function sampleVelocityBilinear(px, py) {
+  px = Math.max(0, Math.min(W - 1.001, px));
+  py = Math.max(0, Math.min(H - 1.001, py));
+  const x0 = Math.floor(px), y0 = Math.floor(py);
+  const x1 = Math.min(W - 1, x0 + 1), y1 = Math.min(H - 1, y0 + 1);
+  const sx = px - x0, sy = py - y0;
+  const i00 = IX(x0, y0), i10 = IX(x1, y0), i01 = IX(x0, y1), i11 = IX(x1, y1);
+  const vx = velocity[i00] * (1 - sx) * (1 - sy) + velocity[i10] * sx * (1 - sy) + velocity[i01] * (1 - sx) * sy + velocity[i11] * sx * sy;
+  const vy = velocity[i00 + 1] * (1 - sx) * (1 - sy) + velocity[i10 + 1] * sx * (1 - sy) + velocity[i01 + 1] * (1 - sx) * sy + velocity[i11 + 1] * sx * sy;
+  return { x: vx, y: vy };
+}
+
+function stableNoise2D(x, y) {
+  const n = Math.sin(x * 127.1 + y * 311.7) * 43758.5453123;
+  return n - Math.floor(n);
+}
+
+function sampleEnergyCore(px, py) {
+  const v = sampleVelocityBilinear(px, py);
+  const speed = Math.sqrt(v.x * v.x + v.y * v.y);
+  const heat = sampleScalarBilinear(temperature, px, py, 1 / 50);
+  const dens = sampleScalarBilinear(density, px, py, 1);
+  return Math.max(0, Math.min(1, dens * 0.93 + heat * 0.74 + speed * 0.05));
+}
+
+function sampleEnergyAt(px, py) {
+  const c = sampleEnergyCore(px, py);
+  const l = sampleEnergyCore(px - 0.8, py);
+  const r = sampleEnergyCore(px + 0.8, py);
+  const u = sampleEnergyCore(px, py - 0.8);
+  const d = sampleEnergyCore(px, py + 0.8);
+  const d1 = sampleEnergyCore(px - 0.55, py - 0.55);
+  const d2 = sampleEnergyCore(px + 0.55, py - 0.55);
+  const d3 = sampleEnergyCore(px - 0.55, py + 0.55);
+  const d4 = sampleEnergyCore(px + 0.55, py + 0.55);
+  return c * 0.30 + (l + r + u + d) * 0.11 + (d1 + d2 + d3 + d4) * 0.065;
+}
+
+function sampleGradient(px, py) {
+  const dX = sampleEnergyAt(px + 0.9, py) - sampleEnergyAt(px - 0.9, py);
+  const dY = sampleEnergyAt(px, py + 0.9) - sampleEnergyAt(px, py - 0.9);
+  return { x: dX, y: dY };
+}
+
+function lowFrequencyFlow(x, y, time) {
+  const t = time * 0.000085;
+  return {
+    x: Math.sin(x * 0.036 + t * 1.02) * 0.21 + Math.cos(y * 0.024 - t * 0.70) * 0.15 + Math.sin((x + y) * 0.012 + t * 0.38) * 0.055,
+    y: Math.cos(y * 0.034 - t * 0.86) * 0.20 + Math.sin((x + y) * 0.016 + t * 0.53) * 0.14 + Math.cos(x * 0.018 - t * 0.29) * 0.05
+  };
+}
+
+function sampleContinuousFlow(x, y, time) {
+  const baseVel = sampleVelocityBilinear(x, y);
+  const bias = lowFrequencyFlow(x, y, time);
+  const grad = sampleGradient(x, y);
+  const vx = baseVel.x + bias.x - grad.x * 0.22;
+  const vy = baseVel.y + bias.y - grad.y * 0.22;
+  const speed = Math.sqrt(vx * vx + vy * vy) + 1e-6;
+  const dirX = vx / speed, dirY = vy / speed;
+  const trace = 0.18 + Math.min(1.0, speed * 0.042);
+  const jx = (stableNoise2D(x + 13.1, y + 7.2) - 0.5) * 0.16;
+  const jy = (stableNoise2D(x + 3.7, y + 19.4) - 0.5) * 0.16;
+  const px = x + dirX * 0.16 - grad.x * 0.18 + jx;
+  const py = y + dirY * 0.16 - grad.y * 0.18 + jy;
+  const e0 = sampleEnergyAt(px, py);
+  const e1 = sampleEnergyAt(px - vx * trace, py - vy * trace);
+  const e2 = sampleEnergyAt(px - vx * trace * 1.9, py - vy * trace * 1.9);
+  const e3 = sampleEnergyAt(px - vx * trace * 3.0, py - vy * trace * 3.0);
+  const e4 = sampleEnergyAt(px - vx * trace * 4.2, py - vy * trace * 4.2);
+  const energy = e0 * 0.36 + e1 * 0.27 + e2 * 0.20 + e3 * 0.11 + e4 * 0.06;
+  return { energy, vx, vy, speed, px, py, gradX: grad.x, gradY: grad.y, jitterX: jx, jitterY: jy };
+}
+
+function computeSmoothLighting(x, y, time) {
+  const eC = sampleContinuousFlow(x, y, time).energy;
+  const eL = sampleContinuousFlow(x - 0.9, y, time).energy;
+  const eR = sampleContinuousFlow(x + 0.9, y, time).energy;
+  const eU = sampleContinuousFlow(x, y - 0.9, time).energy;
+  const eD = sampleContinuousFlow(x, y + 0.9, time).energy;
+  const dX = (eR - eL) * 0.82;
+  const dY = (eD - eU) * 0.82;
+  let nx = -dX * 2.25, ny = -dY * 2.25, nz = 1.0;
+  const invLen = 1 / Math.sqrt(nx * nx + ny * ny + nz * nz);
+  nx *= invLen; ny *= invLen; nz *= invLen;
+  const lx = -0.4, ly = -0.3, lz = 0.8;
+  const invLightLen = 1 / Math.sqrt(lx * lx + ly * ly + lz * lz);
+  const lit = Math.max(0, nx * lx * invLightLen + ny * ly * invLightLen + nz * lz * invLightLen);
+  const diffuse = 0.18 + Math.pow(lit, 1.04) * 0.82;
+  const fresnel = Math.pow(1.0 - Math.max(0, nz), 2.7);
+  const scatter = Math.pow(Math.max(0, 1.0 - lit), 1.45) * (0.34 + eC * 0.34);
+  return { diffuse, fresnel, scatter };
+}
+
+function alphaNoise(x, y, time) {
+  const a = stableNoise2D(x * 0.91 + 8.1, y * 0.87 + 2.4);
+  const b = stableNoise2D(x * 0.43 + 17.3, y * 0.49 + 11.8);
+  const drift = Math.sin((x + y) * 0.013 + time * 0.00022) * 0.02;
+  return (((a * 0.58 + b * 0.42) - 0.5) * 0.08 + 1.0 + drift);
+}
+
+function fluidColor(energy, vx, vy, diffuse, fresnel, scatter) {
+  const t = Math.max(0, Math.min(1, Math.pow(energy, 0.82)));
+  const low = Math.max(0, Math.min(1, (t - 0.02) / 0.42));
+  const mid = Math.max(0, Math.min(1, (t - 0.18) / 0.42));
+  const high = Math.max(0, Math.min(1, (t - 0.58) / 0.24));
+
+  const dir = (Math.atan2(vy, vx) / Math.PI + 1) * 0.5;
+  const hueShift = (dir - 0.5) * 9;
+
+  // Premium cinematic palette (deeper, richer, more volumetric)
+  const deep = [8, 18, 55];
+  const cyan = [55, 175, 235];
+  const whiteBlue = [225, 242, 255];
+
+  let r = deep[0] * (1 - low) + cyan[0] * low;
+  let g = deep[1] * (1 - low) + cyan[1] * low;
+  let b = deep[2] * (1 - low) + cyan[2] * low;
+
+  r = r * (1 - high) + whiteBlue[0] * high;
+  g = g * (1 - high) + whiteBlue[1] * high;
+  b = b * (1 - high) + whiteBlue[2] * high;
+
+  r += hueShift * 0.14;
+  g += hueShift * 0.18;
+  b -= hueShift * 0.08;
+
+  const shade = 0.44 + diffuse * 0.72 + scatter * 0.13 + fresnel * 0.20;
+  const emissive = high * 0.20 + fresnel * 0.08 + scatter * 0.05;
+
+  return [
+    Math.min(255, Math.max(0, r * shade + 26 * emissive)),
+    Math.min(255, Math.max(0, g * shade + 34 * emissive)),
+    Math.min(255, Math.max(0, b * (0.97 + diffuse * 0.14 + fresnel * 0.06) + 52 * emissive))
+  ];
+}
+
+// =====================================================
+// 6. RENDER HELPERS
+// =====================================================
+function ensureRenderFX() {
+  if (!renderFX.sceneCanvas) {
+    renderFX.sceneCanvas = document.createElement("canvas"); renderFX.sceneCtx = renderFX.sceneCanvas.getContext("2d");
+    renderFX.bloomCanvas = document.createElement("canvas"); renderFX.bloomCtx = renderFX.bloomCanvas.getContext("2d");
+    renderFX.trailCanvas = document.createElement("canvas"); renderFX.trailCtx = renderFX.trailCanvas.getContext("2d");
+    renderFX.feedbackCanvas = document.createElement("canvas"); renderFX.feedbackCtx = renderFX.feedbackCanvas.getContext("2d");
+  }
+  if (renderFX.sceneCanvas.width !== W || renderFX.sceneCanvas.height !== H) {
+    renderFX.sceneCanvas.width = W; renderFX.sceneCanvas.height = H;
+  }
+  const bloomW = Math.max(1, canvas.width >> 1);
+  const bloomH = Math.max(1, canvas.height >> 1);
+  if (renderFX.bloomCanvas.width !== bloomW || renderFX.bloomCanvas.height !== bloomH) {
+    renderFX.bloomCanvas.width = bloomW; renderFX.bloomCanvas.height = bloomH;
+  }
+  if (renderFX.trailCanvas.width !== canvas.width || renderFX.trailCanvas.height !== canvas.height) {
+    renderFX.trailCanvas.width = canvas.width; renderFX.trailCanvas.height = canvas.height;
+    renderFX.trailCtx.fillStyle = "#0b0f1a"; renderFX.trailCtx.fillRect(0, 0, canvas.width, canvas.height);
+  }
+  if (renderFX.feedbackCanvas.width !== canvas.width || renderFX.feedbackCanvas.height !== canvas.height) {
+    renderFX.feedbackCanvas.width = canvas.width; renderFX.feedbackCanvas.height = canvas.height;
+  }
+}
+
+function softStreak(ctx2d, x, y, vx, vy, radius, stretch, color, alpha) {
+  const angle = Math.atan2(vy, vx);
+  const major = radius * stretch;
+  const minor = radius;
+  ctx2d.save();
+  ctx2d.translate(x + vx * 0.038, y + vy * 0.038);
+  ctx2d.rotate(angle);
+  ctx2d.scale(major, minor);
+  const g = ctx2d.createRadialGradient(0, 0, 0, 0, 0, 1);
+  g.addColorStop(0.0, `rgba(${color[0]}, ${color[1]}, ${color[2]}, ${alpha})`);
+  g.addColorStop(0.22, `rgba(${color[0]}, ${color[1]}, ${color[2]}, ${alpha * 0.68})`);
+  g.addColorStop(0.56, `rgba(${color[0]}, ${color[1]}, ${color[2]}, ${alpha * 0.22})`);
+  g.addColorStop(1.0, `rgba(${color[0]}, ${color[1]}, ${color[2]}, 0)`);
+  ctx2d.fillStyle = g;
+  ctx2d.beginPath();
+  ctx2d.arc(0, 0, 1, 0, Math.PI * 2);
+  ctx2d.fill();
+  ctx2d.restore();
+}
+
+function drawLayer(ctx2d, x, y, vx, vy, color, alpha, radius, stretch, offsetX, offsetY) {
+  softStreak(ctx2d, x + offsetX, y + offsetY, vx, vy, radius, stretch, color, alpha);
+}
+
+// =====================================================
+// 7. MAIN DRAW (polished renderer)
+// =====================================================
+function draw() {
+  ensureRenderFX();
+
+  // Update density field for energy sampling
+  for (let y = 0; y < H; y++) {
+    for (let x = 0; x < W; x++) {
+      const idx = x + y * W;
+      const i = IX(x, y);
+      const speed = Math.sqrt(velocity[i] * velocity[i] + velocity[i + 1] * velocity[i + 1]);
+      density[idx] = Math.max(0, Math.min(1, temperature[idx] * 0.018 + speed * 0.045));
+    }
+  }
+
+  const time = simTime || performance.now();
+  const scene = renderFX.sceneCtx;
+  const bloom = renderFX.bloomCtx;
+  const trail = renderFX.trailCtx;
+  const feedback = renderFX.feedbackCtx;
+
+  scene.clearRect(0, 0, W, H);
+  scene.globalCompositeOperation = "source-over";
+
+  for (let y = 1; y < H - 1; y++) {
+    for (let x = 1; x < W - 1; x++) {
+      const flow = sampleContinuousFlow(x, y, time);
+      const energy = flow.energy;
+      if (energy < 0.013) continue;
+
+      const vx = flow.vx, vy = flow.vy, speed = flow.speed;
+      const light = computeSmoothLighting(x, y, time);
+      const color = fluidColor(energy, vx, vy, light.diffuse, light.fresnel, light.scatter);
+      const noise = alphaNoise(x, y, time);
+
+      const px = flow.px + flow.gradX * -0.22 + flow.jitterX;
+      const py = flow.py + flow.gradY * -0.22 + flow.jitterY;
+
+      const baseStretch = 1 + Math.min(5.1, speed * 0.46);
+      const layerSeparation = 0.16 + energy * 0.08;
+
+      const farAlpha = Math.min(0.040, energy * 0.060) * noise;
+      const midAlpha = Math.min(0.132, energy * 0.170 + light.scatter * 0.010) * noise;
+      const nearAlpha = Math.min(0.190, energy * 0.220 + light.fresnel * 0.020) * noise;
+
+      const farRadius = 3.4 + energy * 4.4;
+      const midRadius = 1.28 + energy * 2.35;
+      const nearRadius = 0.32 + energy * 0.62;
+
+      drawLayer(scene, px, py, vx, vy, color, farAlpha, farRadius, baseStretch * 1.02, -vx * layerSeparation * 1.05, -vy * layerSeparation * 1.05);
+      drawLayer(scene, px, py, vx, vy, color, midAlpha, midRadius, baseStretch * 1.52, vx * 0.032, vy * 0.032);
+      drawLayer(scene, px, py, vx, vy, color, nearAlpha, nearRadius, Math.max(1.9, baseStretch * 2.45), vx * 0.138, vy * 0.138);
+
+      if (energy > 0.38) {
+        let filamentAlpha = Math.min(0.28, (energy - 0.38) * 0.82 + speed * 0.012) * noise * filamentMultiplier;
+        const filamentRadius = 0.045 + energy * 0.055;
+        const filamentStretch = Math.max(4.8, baseStretch * 5.2);
+        const filamentColor = [Math.min(255, color[0] + 14), Math.min(255, color[1] + 18), Math.min(255, color[2] + 24)];
+        softStreak(scene, px + vx * 0.16, py + vy * 0.16, vx, vy, filamentRadius, filamentStretch, filamentColor, filamentAlpha);
+        if (energy > 0.60) {
+          softStreak(scene, px + vx * 0.07, py + vy * 0.07, vx, vy, filamentRadius * 0.76, filamentStretch * 0.90, filamentColor, filamentAlpha * 0.58);
+        }
+      }
+    }
+  }
+
+  // Feedback / trail buffer
+  feedback.clearRect(0, 0, canvas.width, canvas.height);
+  feedback.filter = "blur(0.95px)";
+  feedback.globalCompositeOperation = "source-over";
+  feedback.globalAlpha = trailPersistenceAlpha;
+  feedback.drawImage(renderFX.trailCanvas, 0, 0);
+  feedback.filter = "none";
+  feedback.globalAlpha = 1;
+  feedback.globalCompositeOperation = "source-over";
+
+  // Main canvas compositing
+  ctx.globalCompositeOperation = "source-over";
+  ctx.globalAlpha = 1;
+  ctx.fillStyle = "rgba(11,15,26,0.080)";
+  ctx.fillRect(0, 0, canvas.width, canvas.height);
+
+  ctx.globalAlpha = 0.988;
+  ctx.drawImage(renderFX.feedbackCanvas, 0, 0);
+
+  ctx.globalAlpha = 1;
+  ctx.imageSmoothingEnabled = true;
+  ctx.drawImage(renderFX.sceneCanvas, 0, 0, canvas.width, canvas.height);
+
+  // Bloom
+  bloom.clearRect(0, 0, renderFX.bloomCanvas.width, renderFX.bloomCanvas.height);
+  bloom.filter = "blur(22px)";
+  bloom.globalCompositeOperation = "source-over";
+  bloom.globalAlpha = 0.62;
+  bloom.drawImage(renderFX.sceneCanvas, 0, 0, renderFX.bloomCanvas.width, renderFX.bloomCanvas.height);
+  bloom.filter = "none";
+  bloom.globalAlpha = 1;
+
+  ctx.globalCompositeOperation = "screen";
+  ctx.globalAlpha = bloomIntensity;
+  ctx.drawImage(renderFX.bloomCanvas, 0, 0, canvas.width, canvas.height);
+
+  // Update trail buffer for next frame
+  trail.clearRect(0, 0, canvas.width, canvas.height);
+  trail.globalCompositeOperation = "source-over";
+  trail.globalAlpha = 1;
+  trail.drawImage(renderFX.feedbackCanvas, 0, 0);
+  trail.globalAlpha = 0.40;
+  trail.drawImage(canvas, 0, 0);
+  trail.globalAlpha = 1;
+
+  // Cinematic vignette for premium volumetric depth
+  ctx.save();
+  ctx.globalCompositeOperation = "multiply";
+  const vignette = ctx.createRadialGradient(
+    canvas.width * 0.5, canvas.height * 0.5,
+    Math.min(canvas.width, canvas.height) * 0.35,
+    canvas.width * 0.5, canvas.height * 0.5,
+    Math.max(canvas.width, canvas.height) * 0.75
+  );
+  vignette.addColorStop(0, "rgba(11,15,26,0)");
+  vignette.addColorStop(1, "rgba(0,5,20,0.65)");
+  ctx.fillStyle = vignette;
+  ctx.fillRect(0, 0, canvas.width, canvas.height);
+  ctx.restore();
+}
+
+// =====================================================
+// 8. INPUT HANDLING (preserved exactly)
+// =====================================================
+let pointerActive = false;
+let lastPointerX = 0;
+let lastPointerY = 0;
+let hasPointerPosition = false;
+
+function injectImpulse(clientX, clientY, deltaX, deltaY) {
+  const rect = canvas.getBoundingClientRect();
+  if (rect.width <= 0 || rect.height <= 0) return;
+  let gx = Math.floor(((clientX - rect.left) / rect.width) * W);
+  let gy = Math.floor(((clientY - rect.top) / rect.height) * H);
+  gx = Math.max(1, Math.min(W - 2, gx));
+  gy = Math.max(1, Math.min(H - 2, gy));
+  const i = IX(gx, gy);
+  velocity[i] += deltaX * 0.1;
+  velocity[i + 1] += deltaY * 0.1;
+  temperature[gx + gy * W] = Math.min(50, temperature[gx + gy * W] + 2);
+}
+
+canvas.addEventListener("pointerdown", e => {
+  pointerActive = true;
+  lastPointerX = e.clientX;
+  lastPointerY = e.clientY;
+  hasPointerPosition = true;
+  if (e.pointerType !== "mouse" && canvas.setPointerCapture) canvas.setPointerCapture(e.pointerId);
+});
+
+canvas.addEventListener("pointermove", e => {
+  if (!hasPointerPosition) {
+    lastPointerX = e.clientX; lastPointerY = e.clientY; hasPointerPosition = true; return;
+  }
+  const dx = e.clientX - lastPointerX;
+  const dy = e.clientY - lastPointerY;
+  const shouldInject = e.pointerType === "mouse" || pointerActive;
+  if (shouldInject) injectImpulse(e.clientX, e.clientY, dx, dy);
+  lastPointerX = e.clientX;
+  lastPointerY = e.clientY;
+});
+
+function endPointer(pointerId) {
+  pointerActive = false;
+  hasPointerPosition = false;
+  if (canvas.hasPointerCapture?.(pointerId)) canvas.releasePointerCapture(pointerId);
+}
+canvas.addEventListener("pointerup", e => endPointer(e.pointerId));
+canvas.addEventListener("pointercancel", e => endPointer(e.pointerId));
+canvas.addEventListener("pointerleave", e => { if (e.pointerType === "mouse") { pointerActive = false; hasPointerPosition = false; } });
+
+// =====================================================
+// 9. UPDATE, LOOP & RESIZE
+// =====================================================
+function update(time) {
+  multiScaleTurbulence(time * 0.001);
+  applyBuoyancy(time);
+  vorticityConfinement();
+  diffuseVelocity();
+
+  for (let i = 0; i < velocity.length; i++) {
+    if (!Number.isFinite(velocity[i])) velocity[i] = 0;
+    velocity[i] *= 0.9995;
+  }
+
+  applyBoundaries();
+  project();
+  applyBoundaries();
+  velocityPrev.set(velocity);
+  advect();
+  applyBoundaries();
+  project();
+  applyBoundaries();
+  advectTemperature();
+  updateTemperature();
+
+  for (let p of particles) {
+    if (!Number.isFinite(p.x) || !Number.isFinite(p.y)) {
+      p.x = Math.random() * canvas.width;
+      p.y = Math.random() * canvas.height;
+      p.vx = p.vy = p.spin = p.angle = 0;
+    }
+    let v = sampleVelocity(p.x, p.y);
+    p.vx += (v.x - p.vx) * 0.15;
+    p.vy += (v.y - p.vy) * 0.15;
+    p.vx += -v.y * 0.02;
+    p.vy += v.x * 0.02;
+    p.spin += (v.x - v.y) * 0.01;
+    p.angle += p.spin;
+    p.vx += Math.sin(p.y * 0.05 + time * 0.002) * 0.02;
+    p.vy += Math.cos(p.x * 0.05 + time * 0.002) * 0.02;
+    p.vx *= 0.96; p.vy *= 0.96;
+    p.x += p.vx; p.y += p.vy;
+
+    if (p.x < 0) p.x = canvas.width;
+    if (p.x > canvas.width) p.x = 0;
+    if (p.y < 0) p.y = canvas.height;
+    if (p.y > canvas.height) p.y = 0;
+  }
+}
+
+function resizeCanvas() {
+  canvas.width = window.innerWidth;
+  canvas.height = window.innerHeight;
+  pointerActive = false;
+  hasPointerPosition = false;
+  for (let p of particles) {
+    p.x = Math.max(0, Math.min(canvas.width, p.x));
+    p.y = Math.max(0, Math.min(canvas.height, p.y));
+  }
+  if (renderFX.trailCanvas) {
+    renderFX.trailCanvas.width = canvas.width;
+    renderFX.trailCanvas.height = canvas.height;
+    renderFX.trailCtx.fillStyle = "#0b0f1a";
+    renderFX.trailCtx.fillRect(0, 0, canvas.width, canvas.height);
+  }
+  if (renderFX.feedbackCanvas) {
+    renderFX.feedbackCanvas.width = canvas.width;
+    renderFX.feedbackCanvas.height = canvas.height;
+  }
+  if (renderFX.bloomCanvas) {
+    renderFX.bloomCanvas.width = Math.max(1, canvas.width >> 1);
+    renderFX.bloomCanvas.height = Math.max(1, canvas.height >> 1);
+  }
+}
+
+function loop(time) {
+  if (!lastFrameTime) lastFrameTime = time;
+  accumulator += Math.min(time - lastFrameTime, MAX_FRAME_MS);
+  lastFrameTime = time;
+
+  while (accumulator >= FIXED_STEP_MS) {
+    simTime += FIXED_STEP_MS;
+    update(simTime);
+    accumulator -= FIXED_STEP_MS;
+  }
+
+  draw();
+  requestAnimationFrame(loop);
+}
+
+// =====================================================
+// 10. UI INITIALIZATION
+// =====================================================
+function initializeControls() {
+  const ui = document.getElementById("controls");
+  const bloomS = document.getElementById("bloomS");
+  const trailS = document.getElementById("trailS");
+  const filS = document.getElementById("filS");
+  const bloomVal = document.getElementById("bloomVal");
+  const trailVal = document.getElementById("trailVal");
+  const filVal = document.getElementById("filVal");
+
+  bloomS.addEventListener("input", () => {
+    bloomIntensity = parseFloat(bloomS.value);
+    bloomVal.textContent = bloomIntensity.toFixed(2);
+  });
+  trailS.addEventListener("input", () => {
+    trailPersistenceAlpha = parseFloat(trailS.value);
+    trailVal.textContent = trailPersistenceAlpha.toFixed(3);
+  });
+  filS.addEventListener("input", () => {
+    filamentMultiplier = parseFloat(filS.value);
+    filVal.textContent = filamentMultiplier.toFixed(2);
+  });
+
+  // Keyboard toggle
+  document.addEventListener("keydown", e => {
+    if (e.key.toLowerCase() === "h") {
+      ui.style.display = ui.style.display === "none" ? "block" : "none";
+    }
+  });
+}
+
+// Start everything
+resizeCanvas();
+window.addEventListener("resize", resizeCanvas);
+initializeControls();
+requestAnimationFrame(loop);
+</script>
+</body>
+</html>
+
+

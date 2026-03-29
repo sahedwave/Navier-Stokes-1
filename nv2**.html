@@ -1,0 +1,514 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<title>AETHER — Real-Time Fluid Field Simulation</title>
+<style>
+  :root{
+    --bg:#0b0f1a;
+    --panel:rgba(11,15,26,0.78);
+    --border:rgba(176,224,255,0.12);
+    --text:#b0e0ff;
+  }
+
+  *{box-sizing:border-box}
+  html,body{margin:0;height:100%;overflow:hidden;background:var(--bg);font-family:system-ui,sans-serif}
+  canvas{display:block;width:100%;height:100%;touch-action:none}
+
+  #controls{
+    position:absolute;
+    top:20px;
+    left:20px;
+    z-index:20;
+    min-width:240px;
+    padding:16px 18px;
+    border-radius:14px;
+    background:var(--panel);
+    color:var(--text);
+    border:1px solid var(--border);
+    box-shadow:0 14px 40px rgba(0,0,0,0.45);
+    backdrop-filter:blur(12px);
+    display:none;
+  }
+  #controls.show{display:block}
+  #controls h3{
+    margin:0 0 12px 0;
+    font-size:13px;
+    letter-spacing:.12em;
+    font-weight:600;
+    opacity:.9;
+  }
+  .control{
+    display:flex;
+    align-items:center;
+    justify-content:space-between;
+    gap:12px;
+    margin:10px 0;
+    font-size:12px;
+  }
+  .control label{min-width:108px}
+  .control input[type="range"]{width:150px}
+  .value{
+    width:42px;
+    text-align:right;
+    font-family:ui-monospace,SFMono-Regular,Menlo,monospace;
+    font-size:11px;
+    opacity:.85;
+  }
+  .hint{
+    margin-top:12px;
+    font-size:11px;
+    line-height:1.35;
+    opacity:.7;
+  }
+
+  #intro{
+    position:absolute;
+    inset:0;
+    z-index:30;
+    display:flex;
+    align-items:center;
+    justify-content:center;
+    background:
+      radial-gradient(circle at center, rgba(40,80,120,0.10), transparent 55%),
+      #0b0f1a;
+    transition:opacity 1.8s ease;
+    pointer-events:none;
+  }
+  #intro.hide{opacity:0}
+  .intro-inner{
+    text-align:center;
+    color:#d8f1ff;
+    opacity:0;
+    transform:translateY(28px) scale(0.98);
+    animation:introIn 1.8s cubic-bezier(.23,1,.32,1) forwards .4s;
+  }
+  .intro-inner h1{
+    margin:0;
+    font-size:clamp(3rem,10vw,8rem);
+    line-height:.9;
+    font-weight:300;
+    letter-spacing:-.05em;
+    text-shadow:0 0 40px rgba(176,224,255,.2);
+  }
+  .intro-inner p{
+    margin:1rem 0 0 0;
+    font-size:clamp(.85rem,1.6vw,1.15rem);
+    letter-spacing:.45em;
+    text-transform:uppercase;
+    opacity:.72;
+  }
+  @keyframes introIn{
+    to{opacity:1;transform:translateY(0) scale(1)}
+  }
+</style>
+</head>
+<body>
+<canvas id="c"></canvas>
+
+<div id="controls">
+  <h3>FLUID CONTROLS</h3>
+
+  <div class="control">
+    <label>Bloom</label>
+    <input id="bloomS" type="range" min="0" max="1" step="0.01" value="0.28">
+    <span id="bloomV" class="value">0.28</span>
+  </div>
+
+  <div class="control">
+    <label>Trail</label>
+    <input id="trailS" type="range" min="0.80" max="0.99" step="0.001" value="0.93">
+    <span id="trailV" class="value">0.930</span>
+  </div>
+
+  <div class="control">
+    <label>Impulse</label>
+    <input id="impulseS" type="range" min="0.2" max="3" step="0.05" value="1.2">
+    <span id="impulseV" class="value">1.20</span>
+  </div>
+
+  <div class="hint">Press <strong>H</strong> to toggle this panel • Drag to shape the field</div>
+</div>
+
+<div id="intro">
+  <div class="intro-inner">
+    <h1>AETHER</h1>
+    <p>Real-Time Fluid Field Simulation</p>
+  </div>
+</div>
+
+<script>
+(() => {
+  const canvas = document.getElementById("c");
+  const ctx = canvas.getContext("2d");
+
+  const off = document.createElement("canvas");
+  const offCtx = off.getContext("2d");
+
+  const bloomCanvas = document.createElement("canvas");
+  const bloomCtx = bloomCanvas.getContext("2d");
+
+  const W = 160;
+  const H = 90;
+
+  let vw = window.innerWidth;
+  let vh = window.innerHeight;
+
+  canvas.width = vw;
+  canvas.height = vh;
+  off.width = W;
+  off.height = H;
+  bloomCanvas.width = Math.max(1, vw >> 1);
+  bloomCanvas.height = Math.max(1, vh >> 1);
+
+  const fieldX = new Float32Array(W * H);
+  const fieldY = new Float32Array(W * H);
+  const heat = new Float32Array(W * H);
+  const density = new Float32Array(W * H);
+
+  const tmpX = new Float32Array(W * H);
+  const tmpY = new Float32Array(W * H);
+  const tmpHeat = new Float32Array(W * H);
+  const tmpDensity = new Float32Array(W * H);
+
+  const ripples = [];
+
+  let bloomAmount = 0.28;
+  let trailFade = 0.93;
+  let impulseStrength = 1.2;
+
+  let pointerDown = false;
+  let prevX = 0;
+  let prevY = 0;
+  let interacted = false;
+  let introHidden = false;
+
+  const controls = document.getElementById("controls");
+  const intro = document.getElementById("intro");
+
+  const bloomS = document.getElementById("bloomS");
+  const trailS = document.getElementById("trailS");
+  const impulseS = document.getElementById("impulseS");
+  const bloomV = document.getElementById("bloomV");
+  const trailV = document.getElementById("trailV");
+  const impulseV = document.getElementById("impulseV");
+
+  function idx(x, y){ return x + y * W; }
+  function clamp(v, a, b){ return Math.max(a, Math.min(b, v)); }
+  function lerp(a, b, t){ return a + (b - a) * t; }
+
+  bloomS.addEventListener("input", () => {
+    bloomAmount = parseFloat(bloomS.value);
+    bloomV.textContent = bloomAmount.toFixed(2);
+  });
+  trailS.addEventListener("input", () => {
+    trailFade = parseFloat(trailS.value);
+    trailV.textContent = trailFade.toFixed(3);
+  });
+  impulseS.addEventListener("input", () => {
+    impulseStrength = parseFloat(impulseS.value);
+    impulseV.textContent = impulseStrength.toFixed(2);
+  });
+
+  document.addEventListener("keydown", (e) => {
+    if (e.key.toLowerCase() === "h") {
+      controls.classList.toggle("show");
+    }
+  });
+
+  function resize() {
+    vw = window.innerWidth;
+    vh = window.innerHeight;
+    canvas.width = vw;
+    canvas.height = vh;
+    bloomCanvas.width = Math.max(1, vw >> 1);
+    bloomCanvas.height = Math.max(1, vh >> 1);
+  }
+  window.addEventListener("resize", resize);
+
+  function hideIntro() {
+    if (introHidden) return;
+    introHidden = true;
+    intro.classList.add("hide");
+    setTimeout(() => intro.remove(), 2000);
+  }
+
+  function addRipple(x, y, energy) {
+    ripples.push({
+      x, y,
+      r: 10,
+      a: Math.min(1, 0.25 + energy * 0.08)
+    });
+  }
+
+  function inject(clientX, clientY, dx, dy) {
+    const gx = clamp(Math.floor((clientX / vw) * W), 2, W - 3);
+    const gy = clamp(Math.floor((clientY / vh) * H), 2, H - 3);
+
+    const fx = dx * 0.02 * impulseStrength;
+    const fy = dy * 0.02 * impulseStrength;
+    const e = Math.min(4, Math.hypot(dx, dy) * 0.05 * impulseStrength + 0.6);
+
+    for (let oy = -4; oy <= 4; oy++) {
+      for (let ox = -4; ox <= 4; ox++) {
+        const x = gx + ox;
+        const y = gy + oy;
+        const d2 = ox * ox + oy * oy;
+        if (x < 1 || x > W - 2 || y < 1 || y > H - 2 || d2 > 16) continue;
+
+        const falloff = 1 / (1 + d2);
+        const i = idx(x, y);
+
+        fieldX[i] += fx * falloff * 14;
+        fieldY[i] += fy * falloff * 14;
+        heat[i] += e * falloff * 1.8;
+        density[i] += e * falloff * 0.8;
+      }
+    }
+
+    addRipple(clientX, clientY, e);
+  }
+
+  canvas.addEventListener("pointerdown", (e) => {
+    pointerDown = true;
+    prevX = e.clientX;
+    prevY = e.clientY;
+    interacted = true;
+    hideIntro();
+  });
+
+  canvas.addEventListener("pointerup", () => pointerDown = false);
+  canvas.addEventListener("pointercancel", () => pointerDown = false);
+  canvas.addEventListener("pointerleave", () => pointerDown = false);
+
+  canvas.addEventListener("pointermove", (e) => {
+    if (!interacted) {
+      interacted = true;
+      hideIntro();
+    }
+    const dx = e.clientX - prevX;
+    const dy = e.clientY - prevY;
+    if (pointerDown) inject(e.clientX, e.clientY, dx, dy);
+    prevX = e.clientX;
+    prevY = e.clientY;
+  });
+
+  function advectScalar(src, dst, velScale) {
+    for (let y = 1; y < H - 1; y++) {
+      for (let x = 1; x < W - 1; x++) {
+        const i = idx(x, y);
+        const px = clamp(x - fieldX[i] * velScale, 0.5, W - 1.5);
+        const py = clamp(y - fieldY[i] * velScale, 0.5, H - 1.5);
+
+        const x0 = px | 0;
+        const y0 = py | 0;
+        const x1 = x0 + 1;
+        const y1 = y0 + 1;
+        const sx = px - x0;
+        const sy = py - y0;
+
+        const a = src[idx(x0, y0)];
+        const b = src[idx(x1, y0)];
+        const c = src[idx(x0, y1)];
+        const d = src[idx(x1, y1)];
+
+        dst[i] = lerp(lerp(a, b, sx), lerp(c, d, sx), sy);
+      }
+    }
+  }
+
+  function advectVelocity() {
+    for (let y = 1; y < H - 1; y++) {
+      for (let x = 1; x < W - 1; x++) {
+        const i = idx(x, y);
+        const px = clamp(x - fieldX[i] * 0.08, 0.5, W - 1.5);
+        const py = clamp(y - fieldY[i] * 0.08, 0.5, H - 1.5);
+
+        const x0 = px | 0;
+        const y0 = py | 0;
+        const x1 = x0 + 1;
+        const y1 = y0 + 1;
+        const sx = px - x0;
+        const sy = py - y0;
+
+        const i00 = idx(x0, y0);
+        const i10 = idx(x1, y0);
+        const i01 = idx(x0, y1);
+        const i11 = idx(x1, y1);
+
+        tmpX[i] = lerp(lerp(fieldX[i00], fieldX[i10], sx), lerp(fieldX[i01], fieldX[i11], sx), sy);
+        tmpY[i] = lerp(lerp(fieldY[i00], fieldY[i10], sx), lerp(fieldY[i01], fieldY[i11], sx), sy);
+      }
+    }
+
+    fieldX.set(tmpX);
+    fieldY.set(tmpY);
+  }
+
+  function diffuse(field, out, rate) {
+    for (let y = 1; y < H - 1; y++) {
+      for (let x = 1; x < W - 1; x++) {
+        const i = idx(x, y);
+        out[i] =
+          field[i] * (1 - rate * 4) +
+          rate * (
+            field[idx(x - 1, y)] +
+            field[idx(x + 1, y)] +
+            field[idx(x, y - 1)] +
+            field[idx(x, y + 1)]
+          );
+      }
+    }
+  }
+
+  function simulate(t) {
+    for (let y = 1; y < H - 1; y++) {
+      for (let x = 1; x < W - 1; x++) {
+        const i = idx(x, y);
+
+        const n =
+          Math.sin((x + t * 0.0016) * 0.13) *
+          Math.cos((y - t * 0.0012) * 0.11);
+
+        fieldX[i] += n * 0.012;
+        fieldY[i] += n * 0.008 - heat[i] * 0.0013;
+      }
+    }
+
+    advectVelocity();
+
+    diffuse(heat, tmpHeat, 0.06);
+    diffuse(density, tmpDensity, 0.05);
+    heat.set(tmpHeat);
+    density.set(tmpDensity);
+
+    advectScalar(heat, tmpHeat, 0.10);
+    advectScalar(density, tmpDensity, 0.09);
+    heat.set(tmpHeat);
+    density.set(tmpDensity);
+
+    for (let i = 0; i < fieldX.length; i++) {
+      fieldX[i] *= 0.992;
+      fieldY[i] *= 0.992;
+      heat[i] *= 0.986;
+      density[i] *= 0.988;
+    }
+  }
+
+  function renderField(t) {
+    offCtx.clearRect(0, 0, W, H);
+
+    for (let y = 1; y < H - 1; y++) {
+      for (let x = 1; x < W - 1; x++) {
+        const i = idx(x, y);
+        const vx = fieldX[i];
+        const vy = fieldY[i];
+        const sp = Math.hypot(vx, vy);
+        const h = clamp(heat[i] / 4.5, 0, 1);
+        const d = clamp(density[i], 0, 1);
+        const e = clamp(h * 0.7 + d * 0.6 + sp * 0.06, 0, 1);
+
+        if (e < 0.02) continue;
+
+        const glow = 0.4 + e * 0.6;
+        const r = Math.round(20 + 70 * e + 150 * Math.pow(e, 2.1));
+        const g = Math.round(50 + 140 * e + 50 * Math.sin(t * 0.0005 + x * 0.05));
+        const b = Math.round(90 + 150 * e);
+
+        offCtx.fillStyle = `rgba(${r},${g},${b},${0.08 + glow * 0.22})`;
+
+        const sx = x + vx * 0.18;
+        const sy = y + vy * 0.18;
+        const w = 0.8 + e * 2.6;
+        const hsize = 0.6 + e * 1.8;
+
+        offCtx.fillRect(sx, sy, w, hsize);
+
+        if (e > 0.45) {
+          offCtx.fillStyle = `rgba(220,240,255,${0.06 + e * 0.09})`;
+          offCtx.fillRect(sx - 0.3, sy - 0.2, w * 0.8, hsize * 0.7);
+        }
+      }
+    }
+
+    ctx.fillStyle = `rgba(11,15,26,${1 - trailFade})`;
+    ctx.fillRect(0, 0, vw, vh);
+
+    ctx.globalCompositeOperation = "source-over";
+    ctx.drawImage(off, 0, 0, vw, vh);
+
+    bloomCtx.clearRect(0, 0, bloomCanvas.width, bloomCanvas.height);
+    bloomCtx.filter = "blur(18px)";
+    bloomCtx.globalAlpha = 0.85;
+    bloomCtx.drawImage(off, 0, 0, bloomCanvas.width, bloomCanvas.height);
+    bloomCtx.filter = "none";
+    bloomCtx.globalAlpha = 1;
+
+    ctx.globalCompositeOperation = "screen";
+    ctx.globalAlpha = bloomAmount;
+    ctx.drawImage(bloomCanvas, 0, 0, vw, vh);
+    ctx.globalAlpha = 1;
+
+    drawRipples();
+
+    ctx.globalCompositeOperation = "multiply";
+    const vig = ctx.createRadialGradient(vw * 0.5, vh * 0.5, vw * 0.18, vw * 0.5, vh * 0.5, vw * 0.75);
+    vig.addColorStop(0, "rgba(0,0,0,0)");
+    vig.addColorStop(1, "rgba(0,8,20,0.55)");
+    ctx.fillStyle = vig;
+    ctx.fillRect(0, 0, vw, vh);
+
+    ctx.globalCompositeOperation = "source-over";
+  }
+
+  function drawRipples() {
+    if (!ripples.length) return;
+    ctx.save();
+    ctx.globalCompositeOperation = "screen";
+
+    for (let i = ripples.length - 1; i >= 0; i--) {
+      const r = ripples[i];
+      const grad = ctx.createRadialGradient(r.x, r.y, r.r * 0.2, r.x, r.y, r.r * 1.8);
+      grad.addColorStop(0, `rgba(176,224,255,${r.a})`);
+      grad.addColorStop(1, "rgba(176,224,255,0)");
+      ctx.fillStyle = grad;
+      ctx.beginPath();
+      ctx.arc(r.x, r.y, r.r, 0, Math.PI * 2);
+      ctx.fill();
+
+      r.r += 5.5;
+      r.a *= 0.94;
+      if (r.a < 0.01) ripples.splice(i, 1);
+    }
+
+    ctx.restore();
+  }
+
+  let last = 0;
+  function frame(t) {
+    const dt = Math.min(32, t - last || 16);
+    last = t;
+
+    simulate(t);
+    renderField(t);
+
+    requestAnimationFrame(frame);
+  }
+
+  setTimeout(() => {
+    if (!interacted) hideIntro();
+  }, 4200);
+
+  requestAnimationFrame(frame);
+})();
+</script>// === INTEGRATION POINT 7 (in audio gain modulation inside injectImpulse) ===
+/* Change the audio pulse block to: */
+if (ambientGain) {
+  ambientGain.gain.cancelScheduledValues(audioCtx.currentTime);
+  ambientGain.gain.setValueAtTime(0.28, audioCtx.currentTime);
+  ambientGain.gain.linearRampToValueAtTime(0.07 + masterResonance * 0.04, audioCtx.currentTime + 0.65);
+}
+</script>
+</body>
+</html>

@@ -1,0 +1,130 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<title>AETHER — Fluid Field</title>
+<style>
+body { margin:0; overflow:hidden; background:#0b0f1a; }
+canvas { display:block; }
+</style>
+</head>
+<body>
+<canvas id="c"></canvas>
+
+<script>
+const canvas = document.getElementById("c");
+const ctx = canvas.getContext("2d");
+canvas.width = innerWidth;
+canvas.height = innerHeight;
+
+const W = 128, H = 128;
+function IX(x,y){ return (x+y*W)*2; }
+
+let velocity = new Float32Array(W*H*2);
+let velocityPrev = new Float32Array(W*H*2);
+let pressure = new Float32Array(W*H);
+let div = new Float32Array(W*H);
+let temp = new Float32Array(W*H);
+
+function advect(){
+  for(let y=1;y<H-1;y++)for(let x=1;x<W-1;x++){
+    let i=IX(x,y);
+    let vx=velocityPrev[i], vy=velocityPrev[i+1];
+    let px=x-vx*0.5, py=y-vy*0.5;
+    px=Math.max(0.5,Math.min(W-1.5,px));
+    py=Math.max(0.5,Math.min(H-1.5,py));
+    let x0=Math.floor(px), y0=Math.floor(py);
+    let x1=x0+1, y1=y0+1;
+    let sx=px-x0, sy=py-y0;
+    let i00=IX(x0,y0), i10=IX(x1,y0), i01=IX(x0,y1), i11=IX(x1,y1);
+    velocity[i]=(1-sx)*(1-sy)*velocityPrev[i00]+sx*(1-sy)*velocityPrev[i10]+(1-sx)*sy*velocityPrev[i01]+sx*sy*velocityPrev[i11];
+    velocity[i+1]=(1-sx)*(1-sy)*velocityPrev[i00+1]+sx*(1-sy)*velocityPrev[i10+1]+(1-sx)*sy*velocityPrev[i01+1]+sx*sy*velocityPrev[i11+1];
+  }
+}
+
+function project(){
+  div.fill(0); pressure.fill(0);
+  for(let y=1;y<H-1;y++)for(let x=1;x<W-1;x++){
+    div[x+y*W] = -0.5*(velocity[IX(x+1,y)]-velocity[IX(x-1,y)] + velocity[IX(x,y+1)+1]-velocity[IX(x,y-1)+1]);
+  }
+  for(let k=0;k<10;k++){
+    for(let y=1;y<H-1;y++)for(let x=1;x<W-1;x++){
+      pressure[x+y*W]=(div[x+y*W]+pressure[x-1+y*W]+pressure[x+1+y*W]+pressure[x+(y-1)*W]+pressure[x+(y+1)*W])/4;
+    }
+  }
+  for(let y=1;y<H-1;y++)for(let x=1;x<W-1;x++){
+    let i=IX(x,y);
+    velocity[i]-=0.5*(pressure[x+1+y*W]-pressure[x-1+y*W]);
+    velocity[i+1]-=0.5*(pressure[x+(y+1)*W]-pressure[x+(y-1)*W]);
+  }
+}
+
+function step(){
+  velocityPrev.set(velocity);
+  advect();
+  project();
+
+  // subtle turbulence
+  for(let i=0;i<velocity.length;i++){
+    velocity[i]+= (Math.random()-0.5)*0.002;
+    velocity[i]*=0.999;
+  }
+}
+
+function draw(){
+  ctx.fillStyle="rgba(11,15,26,0.12)";
+  ctx.fillRect(0,0,canvas.width,canvas.height);
+
+  for(let y=0;y<H;y++)for(let x=0;x<W;x++){
+    let i=IX(x,y);
+    let vx=velocity[i], vy=velocity[i+1];
+    let speed=Math.sqrt(vx*vx+vy*vy);
+
+    if(speed<0.01) continue;
+
+    let px = x/W*canvas.width;
+    let py = y/H*canvas.height;
+
+    let energy = Math.min(1,speed*8);
+
+    // color model (clean)
+    let r = 20 + energy*200;
+    let g = 60 + energy*180;
+    let b = 140 + energy*100;
+
+    ctx.fillStyle = `rgba(${r},${g},${b},${energy*0.5})`;
+
+    ctx.beginPath();
+    ctx.arc(px,py, energy*3,0,Math.PI*2);
+    ctx.fill();
+  }
+
+  // cinematic vignette
+  let g = ctx.createRadialGradient(
+    canvas.width/2, canvas.height/2, canvas.width*0.2,
+    canvas.width/2, canvas.height/2, canvas.width*0.9
+  );
+  g.addColorStop(0,"rgba(0,0,0,0)");
+  g.addColorStop(1,"rgba(0,0,0,0.5)");
+  ctx.fillStyle=g;
+  ctx.fillRect(0,0,canvas.width,canvas.height);
+}
+
+canvas.addEventListener("pointermove", e=>{
+  let x = Math.floor(e.clientX / canvas.width * W);
+  let y = Math.floor(e.clientY / canvas.height * H);
+  let i = IX(x,y);
+  velocity[i]+= (Math.random()-0.5)*2;
+  velocity[i+1]+= (Math.random()-0.5)*2;
+});
+
+function loop(){
+  step();
+  draw();
+  requestAnimationFrame(loop);
+}
+
+loop();
+</script>
+</body>
+</html>

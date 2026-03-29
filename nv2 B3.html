@@ -1,0 +1,381 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<title>REAL AIR — Stable Curl Field</title>
+<style>
+  html, body {
+    margin: 0;
+    width: 100%;
+    height: 100%;
+    overflow: hidden;
+    background: #04070d;
+  }
+
+  canvas {
+    display: block;
+    width: 100%;
+    height: 100%;
+  }
+
+  .hud {
+    position: fixed;
+    top: 14px;
+    left: 14px;
+    padding: 10px 12px;
+    border-radius: 12px;
+    color: rgba(220,235,255,0.9);
+    background: rgba(8,12,20,0.55);
+    backdrop-filter: blur(10px);
+    font: 12px/1.4 system-ui, -apple-system, Segoe UI, Roboto, sans-serif;
+    border: 1px solid rgba(255,255,255,0.08);
+    box-shadow: 0 10px 40px rgba(0,0,0,0.35);
+    user-select: none;
+    pointer-events: none;
+  }
+</style>
+</head>
+<body>
+<canvas id="c"></canvas>
+<div class="hud">
+  <div><strong>REAL AIR</strong> — stable curl-flow renderer</div>
+  <div>Drag to inject wind. Click/tap to pulse.</div>
+</div>
+
+<script>
+(() => {
+  const canvas = document.getElementById("c");
+  const ctx = canvas.getContext("2d", { alpha: true });
+
+  let W = 0;
+  let H = 0;
+  let DPR = Math.max(1, Math.min(2, window.devicePixelRatio || 1));
+
+  function resize() {
+    W = window.innerWidth;
+    H = window.innerHeight;
+    canvas.width = Math.floor(W * DPR);
+    canvas.height = Math.floor(H * DPR);
+    canvas.style.width = W + "px";
+    canvas.style.height = H + "px";
+    ctx.setTransform(DPR, 0, 0, DPR, 0, 0);
+  }
+  resize();
+  window.addEventListener("resize", resize);
+
+  // -----------------------------
+  // FIELD
+  // -----------------------------
+  const CELL = 22;
+  let cols = 0;
+  let rows = 0;
+  let fieldX = [];
+  let fieldY = [];
+  let impulseX = [];
+  let impulseY = [];
+
+  function rebuildField() {
+    cols = Math.ceil(W / CELL) + 2;
+    rows = Math.ceil(H / CELL) + 2;
+    const n = cols * rows;
+    fieldX = new Float32Array(n);
+    fieldY = new Float32Array(n);
+    impulseX = new Float32Array(n);
+    impulseY = new Float32Array(n);
+  }
+  rebuildField();
+  window.addEventListener("resize", rebuildField);
+
+  function idx(x, y) {
+    return x + y * cols;
+  }
+
+  // -----------------------------
+  // POINTER
+  // -----------------------------
+  const pointer = {
+    x: W * 0.5,
+    y: H * 0.5,
+    px: W * 0.5,
+    py: H * 0.5,
+    dx: 0,
+    dy: 0,
+    down: false,
+    pulse: 0
+  };
+
+  function pointerMove(x, y) {
+    pointer.dx = x - pointer.x;
+    pointer.dy = y - pointer.y;
+    pointer.px = pointer.x;
+    pointer.py = pointer.y;
+    pointer.x = x;
+    pointer.y = y;
+  }
+
+  canvas.addEventListener("pointerdown", (e) => {
+    pointer.down = true;
+    pointerMove(e.clientX, e.clientY);
+    pointer.pulse = 1;
+  });
+
+  window.addEventListener("pointerup", () => {
+    pointer.down = false;
+  });
+
+  window.addEventListener("pointerpointercancel", () => {
+    pointer.down = false;
+  });
+
+  window.addEventListener("pointermove", (e) => {
+    pointerMove(e.clientX, e.clientY);
+  });
+
+  canvas.addEventListener("click", (e) => {
+    pointerMove(e.clientX, e.clientY);
+    pointer.pulse = 1;
+  });
+
+  // -----------------------------
+  // PARTICLES
+  // -----------------------------
+  const PARTICLE_COUNT = 7000;
+  const particles = new Array(PARTICLE_COUNT);
+
+  function resetParticle(p, randomAge = true) {
+    p.x = Math.random() * W;
+    p.y = Math.random() * H;
+    p.px = p.x;
+    p.py = p.y;
+    p.life = randomAge ? Math.random() * 220 : 220;
+    p.maxLife = 160 + Math.random() * 140;
+    p.size = 0.6 + Math.random() * 1.4;
+    p.seed = Math.random() * 1000;
+  }
+
+  for (let i = 0; i < PARTICLE_COUNT; i++) {
+    particles[i] = {};
+    resetParticle(particles[i], true);
+  }
+
+  // -----------------------------
+  // CURL-LIKE FIELD
+  // -----------------------------
+  let time = 0;
+
+  function sampleBaseField(x, y, t) {
+    const nx = x / W;
+    const ny = y / H;
+
+    // Stable layered rotational field
+    const a =
+      Math.sin(nx * 7.1 + t * 0.55) * Math.cos(ny * 5.3 - t * 0.42) +
+      0.55 * Math.sin(nx * 13.0 - ny * 9.0 + t * 0.28) +
+      0.35 * Math.cos(nx * 3.7 + ny * 11.5 - t * 0.21);
+
+    const b =
+      Math.cos(nx * 6.2 - t * 0.47) * Math.sin(ny * 8.4 + t * 0.31) +
+      0.45 * Math.cos(nx * 12.5 + ny * 7.8 + t * 0.19) +
+      0.25 * Math.sin(nx * 4.6 - ny * 10.4 + t * 0.36);
+
+    // Rotate into a swirling flow vector
+    const ang = (a + b) * 1.8;
+    const mag = 0.55 + 0.45 * Math.sin(a * 2.0 + b * 1.4);
+
+    return {
+      x: Math.cos(ang) * mag,
+      y: Math.sin(ang) * mag
+    };
+  }
+
+  function updateField(dt) {
+    const t = time * 0.001;
+
+    for (let gy = 0; gy < rows; gy++) {
+      for (let gx = 0; gx < cols; gx++) {
+        const i = idx(gx, gy);
+        const x = gx * CELL;
+        const y = gy * CELL;
+
+        const base = sampleBaseField(x, y, t);
+
+        // Pointer-driven localized vortex + directional injection
+        let fx = base.x;
+        let fy = base.y;
+
+        const dx = x - pointer.x;
+        const dy = y - pointer.y;
+        const dist2 = dx * dx + dy * dy + 1;
+
+        const influence = Math.exp(-dist2 / 18000);
+
+        if (pointer.down || pointer.pulse > 0.001) {
+          const tangentX = -dy / Math.sqrt(dist2);
+          const tangentY = dx / Math.sqrt(dist2);
+
+          fx += tangentX * influence * (2.6 + pointer.pulse * 3.0);
+          fy += tangentY * influence * (2.6 + pointer.pulse * 3.0);
+
+          fx += pointer.dx * 0.03 * influence;
+          fy += pointer.dy * 0.03 * influence;
+        }
+
+        impulseX[i] += fx * dt * 0.9;
+        impulseY[i] += fy * dt * 0.9;
+
+        impulseX[i] *= 0.94;
+        impulseY[i] *= 0.94;
+
+        fieldX[i] = base.x * 34 + impulseX[i] * 24;
+        fieldY[i] = base.y * 34 + impulseY[i] * 24;
+      }
+    }
+
+    pointer.pulse *= 0.92;
+    pointer.dx *= 0.82;
+    pointer.dy *= 0.82;
+  }
+
+  function sampleField(x, y) {
+    const gx = Math.max(0, Math.min(cols - 2, Math.floor(x / CELL)));
+    const gy = Math.max(0, Math.min(rows - 2, Math.floor(y / CELL)));
+
+    const tx = (x / CELL) - gx;
+    const ty = (y / CELL) - gy;
+
+    const i00 = idx(gx, gy);
+    const i10 = idx(gx + 1, gy);
+    const i01 = idx(gx, gy + 1);
+    const i11 = idx(gx + 1, gy + 1);
+
+    const ax = fieldX[i00] * (1 - tx) + fieldX[i10] * tx;
+    const bx = fieldX[i01] * (1 - tx) + fieldX[i11] * tx;
+    const ay = fieldY[i00] * (1 - tx) + fieldY[i10] * tx;
+    const by = fieldY[i01] * (1 - tx) + fieldY[i11] * tx;
+
+    return {
+      x: ax * (1 - ty) + bx * ty,
+      y: ay * (1 - ty) + by * ty
+    };
+  }
+
+  // -----------------------------
+  // RENDER
+  // -----------------------------
+  function drawBackground() {
+    ctx.globalCompositeOperation = "source-over";
+    ctx.fillStyle = "rgba(4,7,13,0.10)";
+    ctx.fillRect(0, 0, W, H);
+
+    const g = ctx.createRadialGradient(
+      W * 0.5, H * 0.45, 0,
+      W * 0.5, H * 0.45, Math.max(W, H) * 0.65
+    );
+    g.addColorStop(0, "rgba(30,60,110,0.06)");
+    g.addColorStop(0.45, "rgba(10,20,40,0.035)");
+    g.addColorStop(1, "rgba(0,0,0,0)");
+    ctx.fillStyle = g;
+    ctx.fillRect(0, 0, W, H);
+  }
+
+  function drawParticles(dt) {
+    ctx.globalCompositeOperation = "lighter";
+    ctx.lineCap = "round";
+
+    for (let i = 0; i < particles.length; i++) {
+      const p = particles[i];
+
+      p.life -= dt * 60;
+      if (p.life <= 0) {
+        resetParticle(p, false);
+      }
+
+      p.px = p.x;
+      p.py = p.y;
+
+      const flow = sampleField(p.x, p.y);
+
+      // Mild orbital perturbation for richer motion
+      const wobble = time * 0.0007 + p.seed;
+      const ox = Math.cos(wobble) * 0.18;
+      const oy = Math.sin(wobble * 1.13) * 0.18;
+
+      p.x += (flow.x * 0.34 + ox) * dt * 60;
+      p.y += (flow.y * 0.34 + oy) * dt * 60;
+
+      // Wrap / recycle
+      if (p.x < -20 || p.x > W + 20 || p.y < -20 || p.y > H + 20) {
+        resetParticle(p, false);
+        continue;
+      }
+
+      const dx = p.x - p.px;
+      const dy = p.y - p.py;
+      const speed = Math.sqrt(dx * dx + dy * dy);
+
+      const lifeAlpha = Math.max(0, Math.min(1, p.life / p.maxLife));
+      const alpha = Math.min(1, 0.08 + speed * 0.022) * lifeAlpha;
+
+      const r = Math.min(255, 80 + speed * 18 + 90 * (1 - lifeAlpha));
+      const g = Math.min(255, 150 + speed * 10);
+      const b = 255;
+
+      ctx.strokeStyle = `rgba(${r|0},${g|0},${b|0},${alpha})`;
+      ctx.lineWidth = p.size + speed * 0.02;
+
+      ctx.beginPath();
+      ctx.moveTo(p.px, p.py);
+      ctx.lineTo(p.x, p.y);
+      ctx.stroke();
+    }
+  }
+
+  function drawPointerAura() {
+    const g = ctx.createRadialGradient(pointer.x, pointer.y, 0, pointer.x, pointer.y, 120);
+    g.addColorStop(0, "rgba(140,200,255,0.18)");
+    g.addColorStop(0.4, "rgba(90,150,255,0.08)");
+    g.addColorStop(1, "rgba(0,0,0,0)");
+    ctx.globalCompositeOperation = "lighter";
+    ctx.fillStyle = g;
+    ctx.beginPath();
+    ctx.arc(pointer.x, pointer.y, 120, 0, Math.PI * 2);
+    ctx.fill();
+  }
+
+  // -----------------------------
+  // LOOP
+  // -----------------------------
+  let last = performance.now();
+
+  function frame(now) {
+    const dt = Math.min(0.033, (now - last) / 1000);
+    last = now;
+    time += dt * 1000;
+
+    drawBackground();
+    updateField(dt);
+    drawParticles(dt);
+    if (pointer.down || pointer.pulse > 0.01) drawPointerAura();
+
+    requestAnimationFrame(frame);
+  }
+
+  // Seed initial energy
+  for (let k = 0; k < 8; k++) {
+    pointer.pulse = 1;
+    pointer.x = W * (0.2 + Math.random() * 0.6);
+    pointer.y = H * (0.2 + Math.random() * 0.6);
+    updateField(0.016);
+  }
+  pointer.x = W * 0.5;
+  pointer.y = H * 0.5;
+  pointer.pulse = 0;
+
+  ctx.fillStyle = "#04070d";
+  ctx.fillRect(0, 0, W, H);
+  requestAnimationFrame(frame);
+})();
+</script>
+</body>
+</html>
